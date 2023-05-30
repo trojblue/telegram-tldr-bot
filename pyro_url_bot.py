@@ -1,12 +1,14 @@
 import asyncio
 import json
 import configparser
+import time
+import csv
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
 from apscheduler.schedulers.background import BackgroundScheduler
 from utils.logger import PipelineLogger
-from urllib.parse import urlsplit
 from pyro_functions import *
+from typing import Dict, Any
 
 
 class URLSummarizerBot:
@@ -14,60 +16,62 @@ class URLSummarizerBot:
     def __init__(self, session_name="my_account", group_id=-1001893538021):
         self.session_name = session_name
         self.group_id = group_id
-
         self.summary_group_id = 123456789  # The group id where the bot should post the URLs
-        self.message_storage = self._load_json("message_storage.json", [])
-        self.url_storage = self._load_json("url_storage.json", {})
+
+        self.message_storage = self._load_csv("message_storage.csv", [])
+        self.url_storage: Dict[str, Any] = self._load_csv("url_storage.csv", {})
+
         self.scheduler = BackgroundScheduler()
+
         self.sleep_threshold = 20
         self.logger = PipelineLogger(file_suffix="url_summarizer_bot", verbose=False)
 
-    def _load_json(self, filename, default):
+    def _load_csv(self, filename, default):
         try:
             with open(filename, "r") as f:
-                return json.load(f)
+                return list(csv.DictReader(f))
         except FileNotFoundError:
             return default
 
-    def _save_json(self, filename, data):
-        with open(filename, "w") as f:
-            json.dump(data, f)
+    def _save_csv(self, filename, data):
+        if not data:
+            return
+
+        keys = data[0].keys()
+        with open(filename, 'w', newline='') as f:
+            dict_writer = csv.DictWriter(f, keys)
+            dict_writer.writeheader()
+            dict_writer.writerows(data)
 
     def format_output_message(self, url, url_info):
         # Dummy method for formatting output message
         return url
 
     async def url_listener(self, client, message):
-        url = message.text
-        summary, type = await retrieve_summary_and_type(url)
-        self.message_storage.append({
-            "date": str(datetime.now()),
-            "messageID": message.id,
-            "url": url,
-        })
+
+        if message.chat.id != self.group_id:
+            return
+
+        await self.handle_add_msg(message)
         self.message_storage.sort(key=lambda x: x["date"])
-        if url not in self.url_storage:
-            self.url_storage[url] = {
-                "date": str(datetime.now()),
-                "summary": summary,
-                "type": type,
-                "count": 1,
-            }
-        else:
-            self.url_storage[url]["count"] += 1
 
     async def build_storage(self, client, message):
         print("Building storage...")
         cutoff = datetime.now() - timedelta(days=14)
 
+        # 更新信息
         async for msg in client.search_messages(self.group_id, query="https://"):
             # print(msg.date, msg.text)
             if msg.date > cutoff:
                 # 从最近14天的消息中提取URL, 添加到storage中
                 await self.handle_add_msg(msg)
+                time.sleep(0.3)
 
+        # 排序
         self.message_storage.sort(key=lambda x: x["date"])
         self.logger.info("Finished building storage.")
+
+        # 保存storage
         self.save_storages()
 
         await message.reply("Finished building storage.")
@@ -76,21 +80,34 @@ class URLSummarizerBot:
         """
         处理当前msg object, 并更新self.storage
         """
+        print(f"handling: {msg.text} || {msg.link}")
+
+        if msg.link == "https://t.me/StableDiffusion_CN/1117330":
+            print("STOP")
+
+        # extractions: {[urls], [other_texts], "original_text"}
         extractions = parse_url_string(msg.text)
-        url = extractions["urls"][0] if extractions["urls"] else None  # todo: handle multi urls
+        url_str = extractions["urls"][0] if extractions["urls"] else None  # todo: handle multi urls
         description = extractions["description"]
-        summary, type = await retrieve_summary_and_type(url)
+
+        # 文档总结
+        summary, type = retrieve_summary_and_type(url_str)
 
         additional_info = {
-            "url": url,
+            "url": url_str,
             "description": description,
             "summary": summary,
             "type": type
         }
 
-        await self.update_storage(msg, additional_info)
+        if url_str is not None:
+            self.update_storage(msg, additional_info)
+        else:
+            # todo: handle forwarded messages
+            self.logger.error(f"URL not found from message: {msg.text}, link: {msg.link}")
+            return
 
-    async def update_storage(self, msg:Message, additional_info:dict):
+    def update_storage(self, msg: Message, additional_info: dict):
         """
         输入msg object和相关新信息, 更新self.storage信息
         message_storage: sorted list of dict
@@ -110,7 +127,7 @@ class URLSummarizerBot:
 
         if curr_url not in self.url_storage:
 
-            print(f"new URL: {curr_url} | id: {msg.link.split('/')[-1]} | desc: {additional_info.get('description', None)}")
+            # print(f"new URL: {curr_url} | id: {msg.link.split('/')[-1]} | desc: {additional_info.get('description', None)}")
 
             self.url_storage[curr_url] = {
                 "description": additional_info["description"],
@@ -148,8 +165,18 @@ class URLSummarizerBot:
                 output_message = self.format_output_message(url, url_info)
                 summary_urls.append(output_message)
         if summary_urls:
-            message_text = "\n".join(summary_urls)
-            await client.send_message(self.summary_group_id, f"URL Summary:\n{message_text}")
+            message_text = "\n".join(summary_urls[:10])
+            await message.reply(f"URL Summary:\n{message_text}")
+            # await client.send_message(self.summary_group_id, f"URL Summary:\n{message_text}")
+
+    async def diagnose(self, client, message):
+        msg_storage_len = len(self.message_storage)
+        url_storage_len = len(self.url_storage)
+        await message.reply(f"message_storage: {msg_storage_len}\nurl_storage: {url_storage_len}")
+
+    async def test(self, client, message):
+        await self.post_summary(client, message)
+        # await message.reply("test")
 
     def _get_app(self):
         config = configparser.ConfigParser()
@@ -159,11 +186,12 @@ class URLSummarizerBot:
         return Client("my_account", api_id, api_hash, sleep_threshold=self.sleep_threshold)
 
     def save_storages(self):
-        self._save_json("message_storage.json", self.message_storage)
-        self._save_json("url_storage.json", self.url_storage)
+        self._save_csv("message_storage.csv", self.message_storage)
+        self._save_csv("url_storage.csv", self.url_storage)
 
     def run(self):
         app = self._get_app()
+
         def register_handler(filter, method):
             @app.on_message(filter)
             async def handler(client, message):
@@ -171,8 +199,10 @@ class URLSummarizerBot:
 
         register_handler(filters.regex("(http|https)://") & filters.group, self.url_listener)
         register_handler(filters.command("build_storage") & filters.private, self.build_storage)
-        register_handler(filters.command("start_summarize") & filters.private, self.start_summarization)
-        register_handler(filters.command("summarize") & filters.private, self.post_summary)
+        register_handler(filters.command("start") & filters.private, self.start_summarization)
+        register_handler(filters.command("summary") & filters.private, self.post_summary)
+        register_handler(filters.command("diagnose") & filters.private, self.diagnose)
+        register_handler(filters.command("test") & filters.group, self.test)
 
         self.scheduler.add_job(lambda: asyncio.run(self.post_summary(app)), 'interval', hours=24)
         self.scheduler.add_job(self.save_storages, 'interval', minutes=5)

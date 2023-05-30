@@ -11,15 +11,19 @@ def parse_url_string(orig_text: str) -> dict:
     url_list = []
     other_texts = []
 
-    text = orig_text.split()
-    for t in text:
-        parts = urlsplit(t)
-        if parts.scheme and parts.netloc:
-            url = t
-            url_list.append(url)
-            other_texts.append("[url]")
-        else:
-            other_texts.append(t)
+    if orig_text is not None:
+        try:
+            text = orig_text.split()
+            for t in text:
+                parts = urlsplit(t)
+                if parts.scheme and parts.netloc:
+                    url = t
+                    url_list.append(url)
+                    other_texts.append("[url]")
+                else:
+                    other_texts.append(t)
+        except Exception as e:
+            print(e)
 
     return_dict = {
         "urls": url_list,
@@ -30,7 +34,7 @@ def parse_url_string(orig_text: str) -> dict:
     return return_dict
 
 
-async def retrieve_summary_and_type(url:str):
+def retrieve_summary_and_type(url:str):
     """
     从URL中提取summary和type
     :param url:

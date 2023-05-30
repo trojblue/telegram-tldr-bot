@@ -1,7 +1,10 @@
-
 config.ini
 my_account.session
 my_account.session-journal
+url_storage.json
+message_storage.json
+
+logs/
 
 # ==============================================================================
 
