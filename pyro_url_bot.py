@@ -1,8 +1,10 @@
 import asyncio
 import json
+import configparser
 from datetime import datetime, timedelta
 from pyrogram import Client, filters
 from apscheduler.schedulers.background import BackgroundScheduler
+from utils.logger import PipelineLogger
 
 class URLSummarizerBot:
 
@@ -12,6 +14,8 @@ class URLSummarizerBot:
         self.message_storage = self._load_json("message_storage.json", [])
         self.url_storage = self._load_json("url_storage.json", {})
         self.scheduler = BackgroundScheduler()
+        self.sleep_threshold = 20
+        self.logger = PipelineLogger(file_suffix="url_summarizer_bot", verbose=False)
 
     def _load_json(self, filename, default):
         try:
@@ -52,10 +56,11 @@ class URLSummarizerBot:
             self.url_storage[url]["count"] += 1
 
     async def build_storage(self, client, message):
+        self.logger.info("Building storage...")
         cutoff = datetime.now() - timedelta(days=14)
-        for dialog in await client.get_dialogs():
+        async for dialog in client.get_dialogs():
             if dialog.chat.type in ["supergroup", "group"]:
-                for msg in await client.search_chat_messages(dialog.chat.id, query="http", limit=100):
+                async for msg in client.search_chat_messages(dialog.chat.id, query="https://", limit=100):
                     if msg.date > cutoff and (msg.text.startswith('http://') or msg.text.startswith('https://')):
                         url = msg.text
                         summary, type = await self.retrieve_summary_and_type(url)
@@ -74,12 +79,23 @@ class URLSummarizerBot:
                         else:
                             self.url_storage[url]["count"] += 1
         self.message_storage.sort(key=lambda x: x["date"])
+        self.logger.info("Finished building storage.")
         await message.reply("Finished building storage.")
 
     async def start_summarization(self, client, message):
+
+        print("Started summarization.")
+        self.logger.info("Started listening for URLs.")
+        cutoff = datetime.now() - timedelta(days=14)
+        async for dialog in client.get_dialogs():
+            if dialog.chat.type in ["supergroup", "group"]:
+                async for msg in client.search_chat_messages(dialog.chat.id, query="http", limit=100):
+                    if msg.date > cutoff and (msg.text.startswith('http://') or msg.text.startswith('https://')):
+                        await self.url_listener(client, msg)
         await message.reply("Started listening for URLs.")
 
     async def post_summary(self, client, message=None):
+        self.logger.info("Posting summary...")
         # Get messages from the last 24 hours
         cutoff = datetime.now() - timedelta(days=1)
         summary_urls = []
@@ -94,12 +110,19 @@ class URLSummarizerBot:
             message_text = "\n".join(summary_urls)
             await client.send_message(self.summary_group_id, f"URL Summary:\n{message_text}")
 
+    def _get_app(self):
+        config = configparser.ConfigParser()
+        config.read("config.ini")
+        api_id = config.get("pyrogram", "api_id")
+        api_hash = config.get("pyrogram", "api_hash")
+        return Client("my_account", api_id, api_hash, sleep_threshold=self.sleep_threshold)
+
     def save_storages(self):
         self._save_json("message_storage.json", self.message_storage)
         self._save_json("url_storage.json", self.url_storage)
 
     def run(self):
-        app = Client(self.session_name)
+        app = self._get_app()
 
         @app.on_message(filters.regex("(http|https)://") & filters.group)
         async def url_listener(client, message):
@@ -121,8 +144,8 @@ class URLSummarizerBot:
         self.scheduler.add_job(self.save_storages, 'interval', minutes=5)
         self.scheduler.start()
 
+        print("starting app...")
         app.run()
-
 
 if __name__ == '__main__':
     bot = URLSummarizerBot()
