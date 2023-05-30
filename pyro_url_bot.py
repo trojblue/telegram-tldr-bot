@@ -5,11 +5,16 @@ from datetime import datetime, timedelta
 from pyrogram import Client, filters
 from apscheduler.schedulers.background import BackgroundScheduler
 from utils.logger import PipelineLogger
+from urllib.parse import urlsplit
+from pyro_functions import *
+
 
 class URLSummarizerBot:
 
-    def __init__(self, session_name="my_account"):
+    def __init__(self, session_name="my_account", group_id=-1001893538021):
         self.session_name = session_name
+        self.group_id = group_id
+
         self.summary_group_id = 123456789  # The group id where the bot should post the URLs
         self.message_storage = self._load_json("message_storage.json", [])
         self.url_storage = self._load_json("url_storage.json", {})
@@ -28,20 +33,16 @@ class URLSummarizerBot:
         with open(filename, "w") as f:
             json.dump(data, f)
 
-    async def retrieve_summary_and_type(self, url):
-        # Dummy method for retrieving summary and type
-        return "", ""
-
     def format_output_message(self, url, url_info):
         # Dummy method for formatting output message
         return url
 
     async def url_listener(self, client, message):
         url = message.text
-        summary, type = await self.retrieve_summary_and_type(url)
+        summary, type = await retrieve_summary_and_type(url)
         self.message_storage.append({
             "date": str(datetime.now()),
-            "messageID": message.message_id,
+            "messageID": message.id,
             "url": url,
         })
         self.message_storage.sort(key=lambda x: x["date"])
@@ -56,31 +57,71 @@ class URLSummarizerBot:
             self.url_storage[url]["count"] += 1
 
     async def build_storage(self, client, message):
-        self.logger.info("Building storage...")
+        print("Building storage...")
         cutoff = datetime.now() - timedelta(days=14)
-        async for dialog in client.get_dialogs():
-            if dialog.chat.type in ["supergroup", "group"]:
-                async for msg in client.search_chat_messages(dialog.chat.id, query="https://", limit=100):
-                    if msg.date > cutoff and (msg.text.startswith('http://') or msg.text.startswith('https://')):
-                        url = msg.text
-                        summary, type = await self.retrieve_summary_and_type(url)
-                        self.message_storage.append({
-                            "date": str(msg.date),
-                            "messageID": msg.message_id,
-                            "url": url,
-                        })
-                        if url not in self.url_storage:
-                            self.url_storage[url] = {
-                                "date": str(msg.date),
-                                "summary": summary,
-                                "type": type,
-                                "count": 1,
-                            }
-                        else:
-                            self.url_storage[url]["count"] += 1
+
+        async for msg in client.search_messages(self.group_id, query="https://"):
+            # print(msg.date, msg.text)
+            if msg.date > cutoff:
+                # 从最近14天的消息中提取URL, 添加到storage中
+                await self.handle_add_msg(msg)
+
         self.message_storage.sort(key=lambda x: x["date"])
         self.logger.info("Finished building storage.")
+        self.save_storages()
+
         await message.reply("Finished building storage.")
+
+    async def handle_add_msg(self, msg: Message):
+        """
+        处理当前msg object, 并更新self.storage
+        """
+        extractions = parse_url_string(msg.text)
+        url = extractions["urls"][0] if extractions["urls"] else None  # todo: handle multi urls
+        description = extractions["description"]
+        summary, type = await retrieve_summary_and_type(url)
+
+        additional_info = {
+            "url": url,
+            "description": description,
+            "summary": summary,
+            "type": type
+        }
+
+        await self.update_storage(msg, additional_info)
+
+    async def update_storage(self, msg:Message, additional_info:dict):
+        """
+        输入msg object和相关新信息, 更新self.storage信息
+        message_storage: sorted list of dict
+        url_storage: dict of URL and info
+        """
+        curr_url = additional_info.get("url", None)
+
+        if curr_url is None:
+            self.logger.error(f"URL not found from message: {msg.text}, link: {msg.link}")
+            return
+
+        self.message_storage.append({
+            "date": str(msg.date),
+            "url": additional_info["url"],  # primary key for url_storage
+            "chat_link": msg.link,
+        })
+
+        if curr_url not in self.url_storage:
+
+            print(f"new URL: {curr_url} | id: {msg.link.split('/')[-1]} | desc: {additional_info.get('description', None)}")
+
+            self.url_storage[curr_url] = {
+                "description": additional_info["description"],
+                "summary": additional_info["summary"],
+                "type": additional_info["type"],
+                "chat_links": [msg.link],
+                "count": 1,
+            }
+        else:
+            self.url_storage[curr_url]["count"] += 1
+            self.url_storage[curr_url]["chat_links"].append(msg.link)
 
     async def start_summarization(self, client, message):
 
@@ -123,22 +164,15 @@ class URLSummarizerBot:
 
     def run(self):
         app = self._get_app()
+        def register_handler(filter, method):
+            @app.on_message(filter)
+            async def handler(client, message):
+                await method(client, message)
 
-        @app.on_message(filters.regex("(http|https)://") & filters.group)
-        async def url_listener(client, message):
-            await self.url_listener(client, message)
-
-        @app.on_message(filters.command("build_storage") & filters.private)
-        async def build_storage(client, message):
-            await self.build_storage(client, message)
-
-        @app.on_message(filters.command("start_summarize") & filters.private)
-        async def start_summarization(client, message):
-            await self.start_summarization(client, message)
-
-        @app.on_message(filters.command("summarize") & filters.private)
-        async def post_summary(client, message):
-            await self.post_summary(client, message)
+        register_handler(filters.regex("(http|https)://") & filters.group, self.url_listener)
+        register_handler(filters.command("build_storage") & filters.private, self.build_storage)
+        register_handler(filters.command("start_summarize") & filters.private, self.start_summarization)
+        register_handler(filters.command("summarize") & filters.private, self.post_summary)
 
         self.scheduler.add_job(lambda: asyncio.run(self.post_summary(app)), 'interval', hours=24)
         self.scheduler.add_job(self.save_storages, 'interval', minutes=5)
@@ -146,6 +180,7 @@ class URLSummarizerBot:
 
         print("starting app...")
         app.run()
+
 
 if __name__ == '__main__':
     bot = URLSummarizerBot()
